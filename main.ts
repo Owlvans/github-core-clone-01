@@ -1,4 +1,6 @@
-import { createApp } from './app.ts';
+import { spawn } from 'node:child_process';
+import { createInterface } from 'node:readline';
+import { fileURLToPath } from 'node:url';
 
 const rawEnvUrl = process.env.MAKEFUN_ENV_URL || '';
 const envUrl = rawEnvUrl.replace(/\/+$/, '');
@@ -66,27 +68,38 @@ async function waitForDone() {
 }
 
 async function main() {
-  const server = createApp();
-
-  await new Promise<void>((resolve, reject) => {
-    server.listen(0, () => resolve());
-    server.on('error', reject);
+  const forgePath = fileURLToPath(new URL('./forge', import.meta.url));
+  const child = spawn(forgePath, [], {
+    // The grading pod gives the entry 2 CPUs / 1 GiB but the Go runtime would
+    // otherwise size itself to the host's core count; pin it to the pod budget.
+    env: { ...process.env, GOMAXPROCS: '2', GOMEMLIMIT: '768MiB' },
+    stdio: ['ignore', 'pipe', 'inherit'],
   });
 
-  const address = server.address();
-  if (!address || typeof address === 'string') {
-    throw new Error('Server address is null or a string');
-  }
+  const port = await new Promise<number>((resolve, reject) => {
+    const rl = createInterface({ input: child.stdout! });
+    const timer = setTimeout(() => reject(new Error('forge did not report a port in time')), 30000);
+    child.on('exit', (code) => {
+      clearTimeout(timer);
+      reject(new Error(`forge exited early with code ${code}`));
+    });
+    rl.on('line', (line) => {
+      const m = /^FORGE_PORT (\d+)$/.exec(line.trim());
+      if (m) {
+        clearTimeout(timer);
+        resolve(parseInt(m[1], 10));
+      }
+    });
+  });
 
-  const port = address.port;
-  console.log(`[entry] listening on port ${port}`);
+  console.log(`[entry] forge listening on port ${port}`);
 
   await register(port);
   console.log('[entry] registered; waiting for the env to say done');
 
   await waitForDone();
 
-  server.close();
+  child.kill('SIGTERM');
   console.log('[entry] done');
 }
 
