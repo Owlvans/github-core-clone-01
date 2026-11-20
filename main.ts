@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { chmodSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
@@ -69,6 +70,13 @@ async function waitForDone() {
 
 async function main() {
   const forgePath = fileURLToPath(new URL('./forge', import.meta.url));
+  // A checkout can drop the executable bit (a file stored 0644 in git, for
+  // example after a web-UI upload); restore it so the spawn cannot fail.
+  try {
+    chmodSync(forgePath, 0o755);
+  } catch {
+    // If this fails the spawn below reports the real error.
+  }
   const child = spawn(forgePath, [], {
     // The grading pod gives the entry 2 CPUs / 1 GiB but the Go runtime would
     // otherwise size itself to the host's core count; pin it to the pod budget.
