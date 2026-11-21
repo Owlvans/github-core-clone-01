@@ -1,5 +1,7 @@
-import { spawn } from 'node:child_process';
-import { chmodSync } from 'node:fs';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { chmodSync, copyFileSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
@@ -68,37 +70,78 @@ async function waitForDone() {
   }
 }
 
-async function main() {
-  const forgePath = fileURLToPath(new URL('./forge', import.meta.url));
-  // A checkout can drop the executable bit (a file stored 0644 in git, for
-  // example after a web-UI upload); restore it so the spawn cannot fail.
-  try {
-    chmodSync(forgePath, 0o755);
-  } catch {
-    // If this fails the spawn below reports the real error.
-  }
-  const child = spawn(forgePath, [], {
-    // The grading pod gives the entry 2 CPUs / 1 GiB but the Go runtime would
-    // otherwise size itself to the host's core count; pin it to the pod budget.
-    env: { ...process.env, GOMAXPROCS: '2', GOMEMLIMIT: '768MiB' },
-    stdio: ['ignore', 'pipe', 'inherit'],
-  });
+// The pod mounts the repository read-only, and a checkout can drop the
+// binary's executable bit (the submitted snapshot stored forge as 0644 after
+// a web-UI upload). chmod on the original then fails with EROFS and spawning
+// it dies with EACCES before the forge ever registers, which scores 0 on
+// every column. So the binary is launched from a private copy on a writable,
+// exec-capable filesystem: copying only reads the original (read-only is
+// fine) and the copy gets its executable bit there. Candidate homes are
+// tried in order — the temp dir, /dev/shm, the working directory — because
+// any one of them could in principle be missing, full or mounted noexec;
+// a spawn that errors or exits before reporting its port falls through to
+// the next candidate. The last resort is chmod + spawn of the original,
+// which still works wherever the repository itself is writable.
+const PORT_TIMEOUT_MS = 15000; // the env's boot budget is 20 s; stay inside it
 
-  const port = await new Promise<number>((resolve, reject) => {
+function spawnAndWaitPort(path: string, env: NodeJS.ProcessEnv): Promise<{ child: ChildProcess; port: number }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(path, [], { env, stdio: ['ignore', 'pipe', 'inherit'] });
     const rl = createInterface({ input: child.stdout! });
-    const timer = setTimeout(() => reject(new Error('forge did not report a port in time')), 30000);
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error(`forge at ${path} did not report a port in time`));
+    }, PORT_TIMEOUT_MS);
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
     child.on('exit', (code) => {
       clearTimeout(timer);
-      reject(new Error(`forge exited early with code ${code}`));
+      reject(new Error(`forge at ${path} exited early with code ${code}`));
     });
     rl.on('line', (line) => {
       const m = /^FORGE_PORT (\d+)$/.exec(line.trim());
       if (m) {
         clearTimeout(timer);
-        resolve(parseInt(m[1], 10));
+        resolve({ child, port: parseInt(m[1], 10) });
       }
     });
   });
+}
+
+async function launchForge(): Promise<{ child: ChildProcess; port: number }> {
+  const forgePath = fileURLToPath(new URL('./forge', import.meta.url));
+  // The grading pod gives the entry 2 CPUs / 1 GiB but the Go runtime would
+  // otherwise size itself to the host's core count; pin it to the pod budget.
+  const env = { ...process.env, GOMAXPROCS: '2', GOMEMLIMIT: '768MiB' };
+  let lastErr: unknown = null;
+  for (const base of [tmpdir(), '/dev/shm', process.cwd()]) {
+    try {
+      const dir = mkdtempSync(join(base, 'forge-bin-'));
+      const copyPath = join(dir, 'forge');
+      copyFileSync(forgePath, copyPath);
+      chmodSync(copyPath, 0o755);
+      return await spawnAndWaitPort(copyPath, env);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  try {
+    chmodSync(forgePath, 0o755);
+  } catch {
+    // If this fails the spawn below reports the real error.
+  }
+  try {
+    return await spawnAndWaitPort(forgePath, env);
+  } catch (err) {
+    lastErr = err;
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+}
+
+async function main() {
+  const { child, port } = await launchForge();
 
   console.log(`[entry] forge listening on port ${port}`);
 
